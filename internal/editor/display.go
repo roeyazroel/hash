@@ -252,15 +252,67 @@ func renderedGhostSuffixWidth(ghostText string, streaming, fromAgent bool) int {
 	}
 
 	width := visibleWidth(ghostFirstLine)
-	if fromAgent {
-		if streaming {
-			width += visibleWidth("▌")
-		} else {
-			width += visibleWidth("   [enter]run  [tab]edit  [esc]")
-		}
+	if fromAgent && !strings.Contains(ghostText, "\n") {
+		width += agentGhostDecorationWidth(streaming)
 	}
 
 	return width
+}
+
+func agentGhostDecorationWidth(streaming bool) int {
+	if streaming {
+		return visibleWidth("▌")
+	}
+	return visibleWidth("   [enter]run  [tab]edit  [esc]")
+}
+
+// ghostContinuationRows returns rows introduced after the ghost's first line.
+// The first line is part of the editable cursor line and is accounted for by
+// renderedGhostSuffixWidth in layoutForStandardRender.
+func (d *Display) ghostContinuationRows(ghostText string, streaming, fromAgent bool) int {
+	parts := strings.Split(ghostText, "\n")
+	rows := 0
+	for index, part := range parts[1:] {
+		width := visibleWidth(part)
+		if fromAgent && index == len(parts)-2 {
+			width += agentGhostDecorationWidth(streaming)
+		}
+		rows += d.visualRowsForChars(width)
+	}
+	return rows
+}
+
+func renderGhostText(sb *strings.Builder, ghostText string, streaming, fromAgent bool) {
+	if ghostText == "" {
+		if streaming {
+			sb.WriteString("\x1b[90;3m Agent thinking...\x1b[0m")
+		}
+		return
+	}
+
+	for index, line := range strings.Split(ghostText, "\n") {
+		if index > 0 {
+			sb.WriteString("\r\n")
+			sb.WriteString(ansiClearLine)
+		}
+		if fromAgent {
+			sb.WriteString("\x1b[90;3m")
+			sb.WriteString(line)
+			sb.WriteString(ansiReset)
+		} else {
+			sb.WriteString("\x1b[38;5;242m")
+			sb.WriteString(line)
+			sb.WriteString(ansiReset)
+		}
+	}
+
+	if fromAgent {
+		if streaming {
+			sb.WriteString("\x1b[90m▌\x1b[0m")
+		} else {
+			sb.WriteString("\x1b[90m   [enter]run  [tab]edit  [esc]\x1b[0m")
+		}
+	}
 }
 
 // layoutForStandardRender computes visual cursor/line positions for wrapped input.
@@ -488,37 +540,7 @@ func (d *Display) RenderWithGhost(buf *Buffer, cur *Cursor, hasSelection bool, g
 
 		// Render ghost text on the cursor's line, after the cursor position
 		if i == cursorRow && (ghostText != "" || streaming) {
-			if ghostText == "" && streaming {
-				// Show thinking indicator while waiting for first chunk (agent only)
-				// Use consistent text with response_ui states
-				sb.WriteString("\x1b[90;3m Agent thinking...\x1b[0m")
-			} else if ghostText != "" {
-				// Get the first line of ghost text (for single-line display)
-				ghostFirstLine := ghostText
-				newlineIdx := strings.Index(ghostText, "\n")
-				if newlineIdx >= 0 {
-					ghostFirstLine = ghostText[:newlineIdx]
-				}
-
-				if fromAgent {
-					// Agent suggestions: dim + italic with hints
-					sb.WriteString("\x1b[90;3m") // Dim + italic
-					sb.WriteString(ghostFirstLine)
-					sb.WriteString(ansiReset)
-
-					// Show streaming indicator if still receiving, otherwise show accept hint
-					if streaming {
-						sb.WriteString("\x1b[90m▌\x1b[0m")
-					} else {
-						sb.WriteString("\x1b[90m   [enter]run  [tab]edit  [esc]\x1b[0m")
-					}
-				} else {
-					// Predictions: fish-shell style - just dim gray, no hints
-					sb.WriteString("\x1b[38;5;242m") // Gray (brighter than 90)
-					sb.WriteString(ghostFirstLine)
-					sb.WriteString(ansiReset)
-				}
-			}
+			renderGhostText(&sb, ghostText, streaming, fromAgent)
 		}
 	}
 
@@ -527,6 +549,7 @@ func (d *Display) RenderWithGhost(buf *Buffer, cur *Cursor, hasSelection bool, g
 
 	ghostWidth := renderedGhostSuffixWidth(ghostText, streaming, fromAgent)
 	totalRows, cursorVisualRow, cursorVisualCol := d.layoutForStandardRender(buf, cur, ghostWidth)
+	totalRows += d.ghostContinuationRows(ghostText, streaming, fromAgent)
 	linesBelowCursor := totalRows - 1 - cursorVisualRow
 	if linesBelowCursor > 0 {
 		fmt.Fprintf(&sb, ansiCursorUp, linesBelowCursor)

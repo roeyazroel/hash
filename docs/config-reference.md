@@ -65,6 +65,15 @@ accept_keys = ["right", "tab"]
 confidence_threshold = 0.6
 path_min_count = 2
 path_recency_boost_hours = 24
+
+[autosuggestions]
+enabled = true
+strategies = ["history"]
+min_input_length = 2
+max_buffer_size = 0
+history_ignore = []
+completion_ignore = []
+completion_timeout = "150ms"
 ```
 
 ## `[shell]`
@@ -263,6 +272,25 @@ Local command and path prediction.
 | `confidence_threshold` | float | `0.6` | Minimum confidence score for command predictions. |
 | `path_min_count` | integer | `2` | Minimum uses before a path becomes eligible for suggestions. |
 | `path_recency_boost_hours` | integer | `24` | Recency window for prediction scoring. |
+
+## `[autosuggestions]`
+
+Inline suggestions remain outside the editable buffer until accepted. Strategies
+are evaluated in order and only exact extensions of the current input are shown.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `true` | Show inline autosuggestions while editing. |
+| `strategies` | array of strings | `["history"]` | Ordered strategies: `history`, `match_prev_cmd`, or `completion`. |
+| `min_input_length` | integer | `2` | Minimum number of input runes before lookup. |
+| `max_buffer_size` | integer | `0` | Maximum input runes eligible for lookup; `0` means unlimited. |
+| `history_ignore` | array of strings | `[]` | Simple wildcard patterns that suppress history candidates. |
+| `completion_ignore` | array of strings | `[]` | Simple wildcard patterns that suppress speculative completion candidates. |
+| `completion_timeout` | duration string | `"150ms"` | Positive timeout for opt-in speculative completion. |
+
+`completion` is opt-in because it may inspect local command or filesystem state.
+It never invokes agent-backed completion, and pressing Tab always opens normal
+interactive completion instead.
 
 ## Builtins
 

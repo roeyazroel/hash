@@ -44,6 +44,7 @@ e2e/
 ├── git_recipes_test.go     # Tests for conventional commits, branch cleanup
 ├── learning_e2e_test.go    # Tests for error pattern learning
 ├── completion_test.go      # Tests for three-tier completion
+├── autosuggestion_terminal_test.go # Inline autosuggestion terminal keys
 ├── live_agent_test.go      # Live agent tests (e2e_live tag)
 └── debug_pipe_test.go      # Debug/diagnostic tests for pipe behavior
 ```
@@ -149,6 +150,7 @@ Live tests validate the full ACP protocol stack against `claude-agent-acp`:
 | Completion router | completion_test.go | e2e |
 | Fuzzy matching | completion_test.go | e2e |
 | Priority ordering | completion_test.go | e2e |
+| Inline autosuggestion acceptance and safe Enter | autosuggestion_terminal_test.go | e2e |
 | ACP protocol reliability | live_agent_test.go | e2e_live |
 | Session management | live_agent_test.go | e2e_live |
 | Timeout recovery | live_agent_test.go | e2e_live |

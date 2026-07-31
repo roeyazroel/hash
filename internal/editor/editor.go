@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
 
+	"github.com/tfcace/hash/internal/autosuggest"
 	"github.com/tfcace/hash/internal/trace"
 	"golang.design/x/clipboard"
 	"golang.org/x/term"
@@ -33,26 +35,28 @@ type completionDrillState struct {
 
 // Config configures the editor.
 type Config struct {
-	Keybindings             string                                       // "helix", "emacs", "vim"
-	HistoryFunc             func(dir int, currentLine string) string     // -1=prev, +1=next; currentLine is for saving
-	CompleteFunc            func(line string, pos int) []Completion      // Tab completion
-	CompleteOutcomeFunc     func(line string, pos int) CompletionOutcome // Tab completion with timeout awareness; preferred over CompleteFunc
-	AgentCompleteLine       func(line string) bool                       // Reports whether Tab should submit the line for agent completion
-	PrefetchFunc            func(line string, pos int)                   // Background completion prefetch (on space)
-	SuggestionFunc          func(input string) string                    // Inline suggestion from history (Fish-style)
-	OnInputReady            func()                                       // Called after editor chrome is rendered, before input loop
-	Gutter                  bool                                         // Show gutter indicator
-	Prompt                  string                                       // Prompt string to display before input
-	InputBgColor            string                                       // Background color for submitted input (hex)
-	ScrollbarColor          string                                       // Foreground color for scrollbars (hex)
-	MaxPasteSize            uint                                         // Maximum paste size in bytes (default 10MB)
-	DisableLineContinuation bool                                         // Disable shell-style line continuations on newline/paste
-	InputFrame              *InputFrame                                  // Optional frame for custom input rendering
-	PreventEmptySubmit      bool                                         // Keep editor open when submitting an empty buffer
-	DisableHistorySearch    bool                                         // Disable Ctrl+R history search
-	DisableContextPicker    bool                                         // Disable Ctrl+P context picker
-	ClearOnCancel           bool                                         // Clear display when Ctrl+C cancels input
-	CancelOnEscape          bool                                         // Treat Escape as canceled input instead of mode/completion handling
+	Keybindings             string                                            // "helix", "emacs", "vim"
+	HistoryFunc             func(dir int, currentLine string) string          // -1=prev, +1=next; currentLine is for saving
+	CompleteFunc            func(line string, pos int) []Completion           // Tab completion
+	CompleteOutcomeFunc     func(line string, pos int) CompletionOutcome      // Tab completion with timeout awareness; preferred over CompleteFunc
+	AgentCompleteLine       func(line string) bool                            // Reports whether Tab should submit the line for agent completion
+	PrefetchFunc            func(line string, pos int)                        // Background completion prefetch (on space)
+	SuggestionFunc          func(input string) string                         // Legacy synchronous inline suggestion callback
+	AutosuggestionService   AutosuggestionService                             // Context-aware background inline suggestions
+	AutosuggestionRequest   func(line string, cursor int) autosuggest.Request // Optional shell metadata for autosuggestions
+	OnInputReady            func()                                            // Called after editor chrome is rendered, before input loop
+	Gutter                  bool                                              // Show gutter indicator
+	Prompt                  string                                            // Prompt string to display before input
+	InputBgColor            string                                            // Background color for submitted input (hex)
+	ScrollbarColor          string                                            // Foreground color for scrollbars (hex)
+	MaxPasteSize            uint                                              // Maximum paste size in bytes (default 10MB)
+	DisableLineContinuation bool                                              // Disable shell-style line continuations on newline/paste
+	InputFrame              *InputFrame                                       // Optional frame for custom input rendering
+	PreventEmptySubmit      bool                                              // Keep editor open when submitting an empty buffer
+	DisableHistorySearch    bool                                              // Disable Ctrl+R history search
+	DisableContextPicker    bool                                              // Disable Ctrl+P context picker
+	ClearOnCancel           bool                                              // Clear display when Ctrl+C cancels input
+	CancelOnEscape          bool                                              // Treat Escape as canceled input instead of mode/completion handling
 }
 
 // CompletionOutcome is the result of a completion request, distinguishing
@@ -60,6 +64,12 @@ type Config struct {
 type CompletionOutcome struct {
 	Items    []Completion
 	TimedOut bool
+}
+
+// AutosuggestionService supplies full-line suggestions without touching editor
+// state. Editor owns request cancellation and stale-result rejection.
+type AutosuggestionService interface {
+	Suggest(context.Context, autosuggest.Request) (autosuggest.Candidate, error)
 }
 
 // Result is returned when the editor exits.
@@ -73,6 +83,15 @@ type Result struct {
 
 // GhostTextChan is a channel that receives ghost text updates.
 type GhostTextChan <-chan string
+
+type autosuggestionResult struct {
+	requestID        uint64
+	promptGeneration uint64
+	line             string
+	cursor           int
+	candidate        autosuggest.Candidate
+	err              error
+}
 
 // Editor is the main editor instance.
 type Editor struct {
@@ -106,6 +125,16 @@ type Editor struct {
 	ghostTextChan  GhostTextChan // Channel for streaming ghost text updates
 	ghostErrChan   <-chan error  // Channel for ghost text errors
 	streamingModel string        // Model name for "Thinking..." display
+
+	// Autosuggestion state. Workers only send autosuggestionResult values; all
+	// editor state below is mutated by the event loop.
+	autosuggestionCancel    context.CancelFunc
+	autosuggestionResults   chan autosuggestionResult
+	autosuggestionDone      chan struct{}
+	autosuggestionCloseOnce sync.Once
+	autosuggestionRequestID uint64
+	promptGeneration        uint64
+	autosuggestionCandidate autosuggest.Candidate
 }
 
 // New creates a new editor.
@@ -145,14 +174,16 @@ func New(cfg Config, in io.Reader, out io.Writer) *Editor {
 	state.AllowContextPicker = !cfg.DisableContextPicker
 
 	return &Editor{
-		config:  cfg,
-		input:   inputReader,
-		display: display,
-		state:   state,
-		mode:    mode,
-		in:      in,
-		out:     out,
-		ghost:   NewGhostText(),
+		config:                cfg,
+		input:                 inputReader,
+		display:               display,
+		state:                 state,
+		mode:                  mode,
+		in:                    in,
+		out:                   out,
+		ghost:                 NewGhostText(),
+		autosuggestionResults: make(chan autosuggestionResult, 16),
+		autosuggestionDone:    make(chan struct{}),
 	}
 }
 
@@ -161,14 +192,21 @@ func (e *Editor) SetGhostText(text string) {
 	e.ghost.Set(text)
 }
 
+// SetGhostTextSource sets a non-streaming ghost with explicit ownership.
+func (e *Editor) SetGhostTextSource(text string, source GhostSource) {
+	e.ghost.SetSource(text, source)
+}
+
 // SetGhostTextStreaming sets up streaming ghost text from channels.
 // Text chunks arrive on textCh, errors on errCh.
 func (e *Editor) SetGhostTextStreaming(textCh <-chan string, errCh <-chan error) {
+	e.invalidateAutosuggestion()
 	e.ghostTextChan = textCh
 	e.ghostErrChan = errCh
 	e.ghost.Clear()
 	e.ghost.SetStreaming(true)
-	e.ghost.FromAgent = true // Agent suggestions show hints
+	e.ghost.Source = GhostAgent
+	e.ghost.FromAgent = true // Compatibility for existing callers
 	// Dismiss any active completion menu - ghost text takes precedence
 	e.dismissCompletion()
 }
@@ -180,9 +218,17 @@ func (e *Editor) SetStreamingModel(model string) {
 
 // ClearGhostText removes any ghost text.
 func (e *Editor) ClearGhostText() {
+	e.invalidateAutosuggestion()
 	e.ghost.Clear()
 	e.ghostTextChan = nil
 	e.ghostErrChan = nil
+}
+
+// Close cancels background autosuggestion work. It is safe to call more than
+// once and does not close the result channel while workers might still send.
+func (e *Editor) Close() {
+	e.invalidateAutosuggestion()
+	e.autosuggestionCloseOnce.Do(func() { close(e.autosuggestionDone) })
 }
 
 // SetPromptWidth sets the prompt width for cursor positioning.
@@ -284,6 +330,7 @@ func (e *Editor) Run(ctx context.Context) (Result, error) {
 	// Start keyboard reader goroutine
 	keyCh, keyErrCh, done := e.startKeyReader()
 	defer func() {
+		e.Close()
 		close(done)
 		// Wait for the goroutine to fully exit so it stops reading stdin.
 		// Without this, the goroutine may still be polling stdin when
@@ -373,6 +420,8 @@ func (e *Editor) runEventLoop(ctx context.Context, sigCh <-chan os.Signal, keyCh
 			e.handleGhostTextUpdate(text, ok)
 		case err, ok := <-e.ghostErrChan:
 			e.handleGhostTextError(err, ok)
+		case result := <-e.autosuggestionResults:
+			e.handleAutosuggestionResult(result)
 		case err, ok := <-keyErrCh:
 			if !ok {
 				keyErrCh = nil
@@ -457,10 +506,16 @@ func (e *Editor) handleKeyEvent(key Key) (Result, bool) {
 		return Result{}, false
 	}
 
+	beforeLine := e.state.Buffer.Content()
+	beforeCursor := e.cursorOffset()
+
 	// Delegate to mode and process result
 	modeResult := e.mode.HandleKey(key, e.state)
 	if result, done := e.processModeResult(modeResult); done {
 		return result, true
+	}
+	if !modeResult.Complete && (beforeLine != e.state.Buffer.Content() || beforeCursor != e.cursorOffset()) {
+		e.updateSuggestion()
 	}
 
 	e.state.Cursor.Clamp(e.state.Buffer)
@@ -488,6 +543,7 @@ func (e *Editor) handleControlKey(key Key) (Result, bool, bool) {
 }
 
 func (e *Editor) cancelInput() Result {
+	e.invalidateAutosuggestion()
 	e.dismissCompletion()
 	e.ghost.Clear()
 	e.ghostTextChan = nil
@@ -497,6 +553,7 @@ func (e *Editor) cancelInput() Result {
 
 // handleCtrlC handles Ctrl+C key press.
 func (e *Editor) handleCtrlC() (Result, bool) {
+	e.invalidateAutosuggestion()
 	e.dismissCompletion()
 	if e.ghost.Streaming || e.ghostTextChan != nil {
 		e.ghost.Clear()
@@ -526,6 +583,7 @@ func (e *Editor) processModeResult(result ModeResult) (Result, bool) {
 	e.handleAction(result.Action)
 
 	if result.Submit {
+		e.invalidateAutosuggestion()
 		if e.config.PreventEmptySubmit && e.state.Buffer.Content() == "" {
 			e.render()
 			return Result{}, false
@@ -534,10 +592,12 @@ func (e *Editor) processModeResult(result ModeResult) (Result, bool) {
 		return Result{Text: e.state.Buffer.Content()}, true
 	}
 	if result.HistorySearch {
+		e.invalidateAutosuggestion()
 		e.display.Clear()
 		return Result{Text: e.state.Buffer.Content(), HistorySearch: true}, true
 	}
 	if result.ContextPicker {
+		e.invalidateAutosuggestion()
 		e.display.Clear()
 		return Result{Text: e.state.Buffer.Content(), ContextPicker: true}, true
 	}
@@ -552,11 +612,6 @@ func (e *Editor) processModeResult(result ModeResult) (Result, bool) {
 
 	e.handleHistoryNavigation(result)
 	e.handleCompletionAndClipboard(result)
-
-	// Update inline suggestion after buffer changes
-	if result.Action == ActionInsert || result.Action == ActionDelete || result.Action == ActionPaste {
-		e.updateSuggestion()
-	}
 
 	return Result{}, false
 }
@@ -583,6 +638,7 @@ func (e *Editor) handleHistoryNavigation(result ModeResult) {
 // handleCompletionAndClipboard processes completion and clipboard operations.
 func (e *Editor) handleCompletionAndClipboard(result ModeResult) {
 	if result.Complete && !e.ghost.Streaming {
+		e.invalidateAutosuggestion()
 		e.triggerCompletion()
 	}
 	if result.Prefetch {
@@ -601,14 +657,18 @@ func (e *Editor) handleCompletionAndClipboard(result ModeResult) {
 	}
 }
 
-// updateSuggestion queries the SuggestionFunc and sets ghost text for inline suggestions.
+// updateSuggestion refreshes inline suggestions after the buffer or cursor changes.
 func (e *Editor) updateSuggestion() {
+	if e.config.AutosuggestionService != nil {
+		e.updateAutosuggestionAsync()
+		return
+	}
 	if e.config.SuggestionFunc == nil {
 		return
 	}
 
 	// Don't overwrite agent ghost text
-	if e.ghost.FromAgent {
+	if e.ghost.IsProtected() {
 		return
 	}
 
@@ -632,14 +692,101 @@ func (e *Editor) updateSuggestion() {
 		suffix := suggestion[len(content):]
 		if suffix != "" {
 			e.ghost.Set(suffix)
-			e.ghost.FromAgent = false
+			e.ghost.SetSource(suffix, GhostHistory)
 			return
 		}
 	}
 
 	// No match — clear non-agent ghost
-	if !e.ghost.FromAgent {
+	if !e.ghost.IsProtected() {
 		e.ghost.Clear()
+	}
+}
+
+func (e *Editor) updateAutosuggestionAsync() {
+	if e.ghost.IsProtected() {
+		return
+	}
+
+	line := e.state.Buffer.Content()
+	cursor := e.cursorOffset()
+	if candidate := e.autosuggestionCandidate; candidate.Text != "" && cursor == len(line) &&
+		strings.HasPrefix(candidate.Text, line) && candidate.Text != line {
+		e.ghost.SetSource(candidate.Text[len(line):], ghostSource(candidate.Strategy))
+		return
+	}
+	e.autosuggestionCandidate = autosuggest.Candidate{}
+	e.cancelAutosuggestionRequest()
+	if e.ghost.Source == GhostHistory || e.ghost.Source == GhostPreviousCommand || e.ghost.Source == GhostCompletion {
+		e.ghost.Clear()
+	}
+	if cursor != len(line) {
+		return
+	}
+
+	e.autosuggestionRequestID++
+	requestID := e.autosuggestionRequestID
+	request := autosuggest.Request{Line: line, Cursor: cursor}
+	if e.config.AutosuggestionRequest != nil {
+		request = e.config.AutosuggestionRequest(line, cursor)
+	}
+	request.Line = line
+	request.Cursor = cursor
+	ctx, cancel := context.WithCancel(context.Background())
+	e.autosuggestionCancel = cancel
+
+	go func() {
+		candidate, err := e.config.AutosuggestionService.Suggest(ctx, request)
+		result := autosuggestionResult{
+			requestID:        requestID,
+			promptGeneration: e.promptGeneration,
+			line:             line,
+			cursor:           cursor,
+			candidate:        candidate,
+			err:              err,
+		}
+		select {
+		case e.autosuggestionResults <- result:
+		case <-e.autosuggestionDone:
+		}
+	}()
+}
+
+func (e *Editor) handleAutosuggestionResult(result autosuggestionResult) {
+	if result.err != nil || result.requestID != e.autosuggestionRequestID ||
+		result.promptGeneration != e.promptGeneration || result.line != e.state.Buffer.Content() ||
+		result.cursor != e.cursorOffset() || result.cursor != len(result.line) || e.ghost.IsProtected() {
+		return
+	}
+	if result.candidate.Text == "" || result.candidate.Text == result.line || !strings.HasPrefix(result.candidate.Text, result.line) {
+		return
+	}
+	e.autosuggestionCandidate = result.candidate
+	e.ghost.SetSource(result.candidate.Text[len(result.line):], ghostSource(result.candidate.Strategy))
+	e.render()
+}
+
+func (e *Editor) cancelAutosuggestionRequest() {
+	if e.autosuggestionCancel != nil {
+		e.autosuggestionCancel()
+		e.autosuggestionCancel = nil
+	}
+}
+
+func (e *Editor) invalidateAutosuggestion() {
+	e.autosuggestionRequestID++
+	e.autosuggestionCandidate = autosuggest.Candidate{}
+	e.cancelAutosuggestionRequest()
+}
+
+func ghostSource(strategy string) GhostSource {
+	switch strategy {
+	case "match_prev_cmd":
+		return GhostPreviousCommand
+	case "completion":
+		return GhostCompletion
+	default:
+		return GhostHistory
 	}
 }
 
@@ -650,7 +797,7 @@ func (e *Editor) render() {
 	// Pass ghost text to display for inline rendering
 	ghostText := ""
 	ghostStreaming := e.ghost.Streaming
-	ghostFromAgent := e.ghost.FromAgent
+	ghostFromAgent := e.ghost.IsAgentOwned()
 	if e.ghost.Active && !e.ghost.IsEmpty() {
 		ghostText = e.ghost.Remaining()
 	}
@@ -704,7 +851,7 @@ func (e *Editor) handleGhostTextKey(key Key) bool {
 
 	switch key.Special {
 	case KeyTab:
-		if !e.ghost.FromAgent {
+		if !e.ghost.IsAgentOwned() {
 			// For history predictions: Tab dismisses ghost and triggers completion instead.
 			// Use Right arrow to accept predictions (fish-style).
 			e.ghost.Clear()
@@ -727,7 +874,10 @@ func (e *Editor) handleGhostTextKey(key Key) bool {
 		e.ghostErrChan = nil
 		return true
 
-	case KeyRight:
+	case KeyRight, KeyEnd:
+		if e.cursorOffset() != len(e.state.Buffer.Content()) {
+			return false
+		}
 		// Right arrow accepts the full ghost text (fish-style)
 		text := e.ghost.AcceptAll()
 		trace.Agent("ghost_accept", map[string]any{
@@ -738,6 +888,7 @@ func (e *Editor) handleGhostTextKey(key Key) bool {
 		if text != "" {
 			e.insertText(text)
 		}
+		e.invalidateAutosuggestion()
 		// Stop any active streaming
 		e.ghostTextChan = nil
 		e.ghostErrChan = nil
@@ -749,13 +900,14 @@ func (e *Editor) handleGhostTextKey(key Key) bool {
 			"key":    "Escape",
 			"action": "dismiss",
 		})
+		e.invalidateAutosuggestion()
 		e.ghost.Clear()
 		e.ghostTextChan = nil
 		e.ghostErrChan = nil
 		return true
 
 	case KeyEnter:
-		if e.ghost.FromAgent {
+		if e.ghost.IsAgentOwned() {
 			// The [enter]run hint only appears once streaming is done;
 			// before that, Enter must not run a partial or bare command.
 			if e.ghost.Streaming {
@@ -785,6 +937,7 @@ func (e *Editor) handleGhostTextKey(key Key) bool {
 			"key":    "Enter",
 			"action": "dismiss_and_submit",
 		})
+		e.invalidateAutosuggestion()
 		e.ghost.Clear()
 		e.ghostTextChan = nil
 		e.ghostErrChan = nil

@@ -6,21 +6,23 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
 
 // Config represents the Hash shell configuration.
 type Config struct {
-	Shell       ShellConfig              `toml:"shell"`
-	Input       InputConfig              `toml:"input"`
-	Prompt      PromptConfig             `toml:"prompt"`
-	Agent       AgentConfig              `toml:"agent"`
-	Agents      map[string]AgentEndpoint `toml:"-"`
-	History     HistoryConfig            `toml:"history"`
-	Completions CompletionsConfig        `toml:"completions"`
-	Clipboard   ClipboardConfig          `toml:"clipboard"`
-	Prediction  PredictionConfig         `toml:"prediction"`
+	Shell           ShellConfig              `toml:"shell"`
+	Input           InputConfig              `toml:"input"`
+	Prompt          PromptConfig             `toml:"prompt"`
+	Agent           AgentConfig              `toml:"agent"`
+	Agents          map[string]AgentEndpoint `toml:"-"`
+	History         HistoryConfig            `toml:"history"`
+	Completions     CompletionsConfig        `toml:"completions"`
+	Clipboard       ClipboardConfig          `toml:"clipboard"`
+	Prediction      PredictionConfig         `toml:"prediction"`
+	Autosuggestions AutosuggestionsConfig    `toml:"autosuggestions"`
 
 	// LoadIssue records what went wrong while loading this config, so the
 	// shell can surface it (e.g. in `hash status`). Nil when loading was clean.
@@ -128,6 +130,66 @@ type PredictionConfig struct {
 	PathRecencyHours    int      `toml:"path_recency_boost_hours"`
 }
 
+// AutosuggestionsConfig controls inline, history-derived command suggestions.
+// Strategies are evaluated in the configured order.
+type AutosuggestionsConfig struct {
+	Enabled           bool     `toml:"enabled"`
+	Strategies        []string `toml:"strategies"`
+	MinInputLength    int      `toml:"min_input_length"`
+	MaxBufferSize     int      `toml:"max_buffer_size"`
+	HistoryIgnore     []string `toml:"history_ignore"`
+	CompletionIgnore  []string `toml:"completion_ignore"`
+	CompletionTimeout string   `toml:"completion_timeout"`
+}
+
+// ParseCompletionTimeout returns the configured limit for speculative
+// completion work. A timeout must be positive so it cannot accidentally make
+// keystrokes wait forever.
+func (c AutosuggestionsConfig) ParseCompletionTimeout() (time.Duration, error) {
+	timeout, err := time.ParseDuration(c.CompletionTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("invalid completion_timeout %q: %w", c.CompletionTimeout, err)
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("completion_timeout must be positive, got %q", c.CompletionTimeout)
+	}
+	return timeout, nil
+}
+
+// Validate rejects unsupported autosuggestion settings before they reach the
+// editor, where an invalid strategy would otherwise be silently ignored.
+func (c AutosuggestionsConfig) Validate() error {
+	if c.MinInputLength < 0 {
+		return fmt.Errorf("autosuggestions.min_input_length must not be negative")
+	}
+	if c.MaxBufferSize < 0 {
+		return fmt.Errorf("autosuggestions.max_buffer_size must not be negative")
+	}
+	if _, err := c.ParseCompletionTimeout(); err != nil {
+		return fmt.Errorf("autosuggestions.%w", err)
+	}
+
+	known := map[string]struct{}{
+		"history":        {},
+		"match_prev_cmd": {},
+		"completion":     {},
+	}
+	seen := make(map[string]struct{}, len(c.Strategies))
+	for _, strategy := range c.Strategies {
+		if strategy == "" {
+			return fmt.Errorf("autosuggestions.strategies contains an empty strategy name")
+		}
+		if _, ok := known[strategy]; !ok {
+			return fmt.Errorf("autosuggestions.strategies contains unknown strategy %q", strategy)
+		}
+		if _, ok := seen[strategy]; ok {
+			return fmt.Errorf("autosuggestions.strategies contains duplicate strategy %q", strategy)
+		}
+		seen[strategy] = struct{}{}
+	}
+	return nil
+}
+
 // ParseMaxOutputSize parses the MaxOutputSize string and returns bytes.
 func (c *ClipboardConfig) ParseMaxOutputSize() (int64, error) {
 	return ParseSize(c.MaxOutputSize)
@@ -188,6 +250,15 @@ func Default() *Config {
 			PathMinCount:        2,
 			PathRecencyHours:    24,
 		},
+		Autosuggestions: AutosuggestionsConfig{
+			Enabled:           true,
+			Strategies:        []string{"history"},
+			MinInputLength:    2,
+			MaxBufferSize:     0,
+			HistoryIgnore:     []string{},
+			CompletionIgnore:  []string{},
+			CompletionTimeout: "150ms",
+		},
 	}
 }
 
@@ -212,6 +283,9 @@ func Load(configDir string) (*Config, error) {
 
 	cfg.loadNamedAgents(data)
 	applyEmptyDefaults(cfg)
+	if err := cfg.Autosuggestions.Validate(); err != nil {
+		return cfg, err
+	}
 
 	return cfg, nil
 }
@@ -262,10 +336,13 @@ func recoverConfig(configPath string, data []byte, cause error) (*Config, error)
 		}
 		_ = toml.Unmarshal(sub, cfg)
 	}
-	sort.Strings(bad)
-
 	cfg.loadNamedAgents(data)
 	applyEmptyDefaults(cfg)
+	if err := cfg.Autosuggestions.Validate(); err != nil {
+		cfg.Autosuggestions = Default().Autosuggestions
+		bad = append(bad, "autosuggestions")
+	}
+	sort.Strings(bad)
 
 	cfg.LoadIssue = &LoadError{Path: configPath, BadSections: bad, Detail: detail, Err: cause}
 	return cfg, cfg.LoadIssue

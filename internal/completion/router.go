@@ -16,15 +16,16 @@ type Router struct {
 	nextCompleterID   uint64
 	fuzzy             bool
 	completerMu       sync.Mutex
-	completerInFlight map[uint64]completerInFlightCall
+	completerInFlight map[completerInFlightKey]completerInFlightCall
 	prefetchMu        sync.Mutex
 	prefetchInFlight  map[uint64]prefetchInFlightCall
 }
 
 type registeredCompleter struct {
-	completer Completer
-	priority  Priority
-	id        uint64
+	completer   Completer
+	priority    Priority
+	id          uint64
+	speculative bool
 }
 
 type boundedCompletionResult struct {
@@ -39,6 +40,11 @@ type completerCallResult struct {
 
 type completerInFlightCall struct {
 	started time.Time
+}
+
+type completerInFlightKey struct {
+	id          uint64
+	speculative bool
 }
 
 type prefetchInFlightCall struct {
@@ -63,11 +69,22 @@ func (r *Router) Fuzzy() bool {
 // Register adds a completer with the given priority.
 // Lower priority values are tried first.
 func (r *Router) Register(c Completer, priority Priority) {
+	r.register(c, priority, false)
+}
+
+// RegisterSpeculative registers a known-local completer for explicit opt-in
+// background suggestions. Remote or expensive providers must use Register.
+func (r *Router) RegisterSpeculative(c Completer, priority Priority) {
+	r.register(c, priority, true)
+}
+
+func (r *Router) register(c Completer, priority Priority, speculative bool) {
 	r.nextCompleterID++
 	r.completers = append(r.completers, registeredCompleter{
-		completer: c,
-		priority:  priority,
-		id:        r.nextCompleterID,
+		completer:   c,
+		priority:    priority,
+		id:          r.nextCompleterID,
+		speculative: speculative,
 	})
 
 	// Sort by priority (lower first)
@@ -81,6 +98,17 @@ func (r *Router) Register(c Completer, priority Priority) {
 
 // Complete tries each completer in priority order until one returns results.
 func (r *Router) Complete(ctx context.Context, line string, pos int) (Result, error) {
+	return r.complete(ctx, line, pos, false)
+}
+
+// CompleteSpeculative runs only local completers in a separate in-flight lane.
+// It does not fuzzy-filter results and returns at most one item, since a ghost
+// suggestion can display only one exact extension at a time.
+func (r *Router) CompleteSpeculative(ctx context.Context, line string, pos int) (Result, error) {
+	return r.complete(ctx, line, pos, true)
+}
+
+func (r *Router) complete(ctx context.Context, line string, pos int, speculative bool) (Result, error) {
 	start := time.Now()
 	traceEnabled := trace.Enabled("completion")
 
@@ -88,15 +116,19 @@ func (r *Router) Complete(ctx context.Context, line string, pos int) (Result, er
 	query := extractCompletionQuery(line, pos)
 	if traceEnabled {
 		trace.Emit("completion", "router_start", trace.LevelDetailed, map[string]any{
-			"line":       line,
-			"pos":        pos,
-			"query":      query,
-			"fuzzy":      r.fuzzy,
-			"completers": len(r.completers),
+			"line":        line,
+			"pos":         pos,
+			"query":       query,
+			"fuzzy":       r.fuzzy && !speculative,
+			"speculative": speculative,
+			"completers":  len(r.completers),
 		})
 	}
 
 	for _, rc := range r.completers {
+		if speculative && (!rc.speculative || rc.priority >= PriorityAgent) {
+			continue
+		}
 		if ctx.Err() != nil {
 			if traceEnabled {
 				trace.Emit("completion", "router_canceled", trace.LevelDetailed, map[string]any{
@@ -114,7 +146,7 @@ func (r *Router) Complete(ctx context.Context, line string, pos int) (Result, er
 			})
 		}
 
-		result, err := r.completeWithBoundary(ctx, rc, line, pos)
+		result, err := r.completeWithBoundary(ctx, rc, line, pos, speculative)
 		if traceEnabled {
 			errText := ""
 			if err != nil {
@@ -133,15 +165,20 @@ func (r *Router) Complete(ctx context.Context, line string, pos int) (Result, er
 		}
 
 		if len(result.Items) > 0 {
-			result = r.finalizeResult(result, query)
-			if traceEnabled {
-				trace.Emit("completion", "router_done", trace.LevelDetailed, map[string]any{
-					"winner":      rc.completer.Name(),
-					"items":       len(result.Items),
-					"duration_ms": float64(time.Since(start).Microseconds()) / 1000.0,
-				})
+			result = r.finalizeResult(result, query, !speculative)
+			if speculative {
+				result = firstStrictSpeculativeResult(line, pos, result)
 			}
-			return result, nil
+			if len(result.Items) > 0 {
+				if traceEnabled {
+					trace.Emit("completion", "router_done", trace.LevelDetailed, map[string]any{
+						"winner":      rc.completer.Name(),
+						"items":       len(result.Items),
+						"duration_ms": float64(time.Since(start).Microseconds()) / 1000.0,
+					})
+				}
+				return result, nil
+			}
 		}
 	}
 
@@ -155,14 +192,30 @@ func (r *Router) Complete(ctx context.Context, line string, pos int) (Result, er
 	return Result{}, nil
 }
 
-func (r *Router) finalizeResult(result Result, query string) Result {
-	if r.fuzzy && query != "" && !strings.HasSuffix(query, "/") {
+func (r *Router) finalizeResult(result Result, query string, fuzzy bool) Result {
+	if fuzzy && r.fuzzy && query != "" && !strings.HasSuffix(query, "/") {
 		filterQuery := basenameCompletionQuery(query)
 		if filterQuery != "" {
 			result.Items = FuzzyFilter(result.Items, filterQuery)
 		}
 	}
 	result.Items = limitCompletionItems(result.Items)
+	return result
+}
+
+// firstStrictSpeculativeResult selects the first completion which can be
+// rendered as a strict extension of the whole current line. Unlike
+// interactive completion, the speculative lane does not fuzzy-filter results,
+// so the raw first item is not necessarily suitable for a ghost suggestion.
+func firstStrictSpeculativeResult(line string, pos int, result Result) Result {
+	for _, item := range result.Items {
+		candidate, _, ok := ReconstructLine(line, pos, result, item)
+		if ok && candidate != line && strings.HasPrefix(candidate, line) {
+			result.Items = []Item{item}
+			return result
+		}
+	}
+	result.Items = nil
 	return result
 }
 
@@ -173,8 +226,8 @@ func basenameCompletionQuery(query string) string {
 	return query
 }
 
-func (r *Router) completeWithBoundary(ctx context.Context, rc registeredCompleter, line string, pos int) (Result, error) {
-	key := completerInFlightKey(rc)
+func (r *Router) completeWithBoundary(ctx context.Context, rc registeredCompleter, line string, pos int, speculative bool) (Result, error) {
+	key := completerInFlightKey{id: rc.id, speculative: speculative}
 	if !r.beginCompleterCall(key) {
 		return Result{}, nil
 	}
@@ -194,15 +247,11 @@ func (r *Router) completeWithBoundary(ctx context.Context, rc registeredComplete
 	}
 }
 
-func completerInFlightKey(rc registeredCompleter) uint64 {
-	return rc.id
-}
-
-func (r *Router) beginCompleterCall(key uint64) bool {
+func (r *Router) beginCompleterCall(key completerInFlightKey) bool {
 	r.completerMu.Lock()
 	defer r.completerMu.Unlock()
 	if r.completerInFlight == nil {
-		r.completerInFlight = make(map[uint64]completerInFlightCall)
+		r.completerInFlight = make(map[completerInFlightKey]completerInFlightCall)
 	}
 	now := time.Now()
 	if call, ok := r.completerInFlight[key]; ok {
@@ -214,7 +263,7 @@ func (r *Router) beginCompleterCall(key uint64) bool {
 	return true
 }
 
-func (r *Router) endCompleterCall(key uint64) {
+func (r *Router) endCompleterCall(key completerInFlightKey) {
 	r.completerMu.Lock()
 	delete(r.completerInFlight, key)
 	r.completerMu.Unlock()
@@ -223,13 +272,23 @@ func (r *Router) endCompleterCall(key uint64) {
 // CompleteBounded runs completion behind the provided context boundary.
 // This protects UI callers from completers that ignore context cancellation.
 func (r *Router) CompleteBounded(ctx context.Context, line string, pos int) (Result, error) {
+	return r.completeBounded(ctx, line, pos, r.Complete)
+}
+
+// CompleteSpeculativeBounded is CompleteSpeculative with the same worker
+// boundary used by interactive completion for providers that ignore contexts.
+func (r *Router) CompleteSpeculativeBounded(ctx context.Context, line string, pos int) (Result, error) {
+	return r.completeBounded(ctx, line, pos, r.CompleteSpeculative)
+}
+
+func (r *Router) completeBounded(ctx context.Context, line string, pos int, complete func(context.Context, string, int) (Result, error)) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 
 	done := make(chan boundedCompletionResult, 1)
 	go func() {
-		result, err := r.Complete(ctx, line, pos)
+		result, err := complete(ctx, line, pos)
 		done <- boundedCompletionResult{result: result, err: err}
 	}()
 

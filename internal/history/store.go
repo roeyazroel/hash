@@ -1,6 +1,7 @@
 package history
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -262,12 +263,21 @@ func (s *Store) GetAgentInteractions(prompt string, limit int) ([]AgentInteracti
 // The results are deduplicated (by command text) and ordered by most recent first.
 // Returns nil for empty prefix or if no matches are found.
 func (s *Store) SearchByPrefix(prefix string, limit int) ([]string, error) {
+	return s.SearchByPrefixContext(context.Background(), prefix, limit)
+}
+
+// SearchByPrefixContext returns recent successful command prefixes while
+// allowing an editor request to stop an obsolete SQLite query promptly.
+func (s *Store) SearchByPrefixContext(ctx context.Context, prefix string, limit int) ([]string, error) {
 	if prefix == "" {
 		return nil, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	escaped := escapeGlob(prefix)
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT command, MAX(timestamp) as latest
 		FROM commands
 		WHERE command GLOB ? AND exit_code = 0

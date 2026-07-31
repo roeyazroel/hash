@@ -1,6 +1,8 @@
 package history
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -262,5 +264,16 @@ func TestSearchByPrefix_NoMatch(t *testing.T) {
 	}
 	if len(results) != 0 {
 		t.Errorf("got %d results, want 0", len(results))
+	}
+}
+
+func TestSearchByPrefixContext_RespectsCancellation(t *testing.T) {
+	store := newTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.SearchByPrefixContext(ctx, "git", 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SearchByPrefixContext() error = %v, want context.Canceled", err)
 	}
 }

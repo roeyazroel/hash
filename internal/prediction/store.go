@@ -1,10 +1,12 @@
 package prediction
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -112,6 +114,60 @@ func (s *Store) GetSequences(prevCmd, cwd string) ([]CommandSequence, error) {
 		seqs = append(seqs, seq)
 	}
 	return seqs, rows.Err()
+}
+
+// GetSequencesByPrefixContext returns sequence candidates that literally start
+// with prefix. Exact-CWD rows are ordered before generic rows, then each group
+// keeps the established count/recency ordering.
+func (s *Store) GetSequencesByPrefixContext(ctx context.Context, prevCmd, prefix, cwd string) ([]CommandSequence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if prevCmd == "" || prefix == "" {
+		return nil, nil
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, prev_command, next_command, cwd_pattern, count, last_used
+		FROM command_sequences
+		WHERE prev_command = ?
+		  AND next_command GLOB ?
+		  AND (cwd_pattern = ? OR cwd_pattern IS NULL OR cwd_pattern = '')
+		ORDER BY CASE WHEN cwd_pattern = ? THEN 0 ELSE 1 END, count DESC, last_used DESC
+		LIMIT 10
+	`, prevCmd, escapeGlob(prefix)+"*", cwd, cwd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var seqs []CommandSequence
+	for rows.Next() {
+		var seq CommandSequence
+		var cwdPattern sql.NullString
+		if err := rows.Scan(&seq.ID, &seq.PrevCommand, &seq.NextCommand, &cwdPattern, &seq.Count, &seq.LastUsed); err != nil {
+			return nil, err
+		}
+		seq.CwdPattern = cwdPattern.String
+		seqs = append(seqs, seq)
+	}
+	return seqs, rows.Err()
+}
+
+func escapeGlob(value string) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		switch r {
+		case '*', '?', '[', ']':
+			b.WriteByte('[')
+			b.WriteRune(r)
+			b.WriteByte(']')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // RecordPathUsage records a path usage with a command.

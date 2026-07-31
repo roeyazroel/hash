@@ -1,6 +1,7 @@
 package prediction
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 )
@@ -25,6 +26,42 @@ func TestPredictor_PredictCommand(t *testing.T) {
 	}
 	if prediction != "npm test" {
 		t.Errorf("Prediction = %q, want %q", prediction, "npm test")
+	}
+}
+
+func TestPredictor_SuggestCommandPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewStore(filepath.Join(tmpDir, "prediction.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	predictor := NewPredictor(store, DefaultConfig())
+
+	for range 4 {
+		predictor.Record("git pull", "git status", "/project", nil)
+	}
+	for range 10 {
+		predictor.Record("git pull", "git push", "", nil)
+	}
+
+	got, err := predictor.SuggestCommandPrefix(context.Background(), "git pull", "git ", "/project")
+	if err != nil {
+		t.Fatalf("SuggestCommandPrefix() error = %v", err)
+	}
+	if got != "git status" {
+		t.Errorf("SuggestCommandPrefix() = %q, want exact-CWD git status", got)
+	}
+}
+
+func TestPredictor_SuggestCommandPrefix_EmptyPreviousCommand(t *testing.T) {
+	predictor := NewPredictor(nil, DefaultConfig())
+	got, err := predictor.SuggestCommandPrefix(context.Background(), "", "git", "/project")
+	if err != nil {
+		t.Fatalf("SuggestCommandPrefix() error = %v", err)
+	}
+	if got != "" {
+		t.Errorf("SuggestCommandPrefix() = %q, want empty", got)
 	}
 }
 

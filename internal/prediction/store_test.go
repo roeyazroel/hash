@@ -1,6 +1,7 @@
 package prediction
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 )
@@ -33,6 +34,30 @@ func TestStore_RecordAndGetSequence(t *testing.T) {
 	}
 	if seqs[0].Count != 2 {
 		t.Errorf("Count = %d, want 2", seqs[0].Count)
+	}
+}
+
+func TestStore_GetSequencesByPrefixContext_PrefersExactCWDOverFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewStore(filepath.Join(tmpDir, "prediction.db"))
+	if err != nil {
+		t.Fatalf("NewStore error: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.RecordSequence("git", "git status", "/project"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordSequence("git", "git push", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	seqs, err := store.GetSequencesByPrefixContext(context.Background(), "git", "git ", "/project")
+	if err != nil {
+		t.Fatalf("GetSequencesByPrefixContext error: %v", err)
+	}
+	if len(seqs) != 2 || seqs[0].NextCommand != "git status" {
+		t.Fatalf("sequences = %+v, want exact-CWD command first", seqs)
 	}
 }
 

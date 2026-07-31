@@ -1,6 +1,23 @@
 // internal/editor/ghost.go
 package editor
 
+import (
+	"unicode"
+	"unicode/utf8"
+)
+
+// GhostSource identifies the producer that owns visible ghost text.
+type GhostSource uint8
+
+const (
+	GhostNone GhostSource = iota
+	GhostHistory
+	GhostPreviousCommand
+	GhostCompletion
+	GhostAgent
+	GhostLearnedFix
+)
+
 // GhostText represents inline suggestion text that appears after the cursor.
 // Ghost text is shown in dim gray and can be accepted with Tab or dismissed with Esc.
 type GhostText struct {
@@ -8,7 +25,10 @@ type GhostText struct {
 	AcceptedAt int    // Number of characters already accepted (for partial acceptance)
 	Active     bool   // Whether ghost text is currently displayed
 	Streaming  bool   // Whether more text is still arriving
-	FromAgent  bool   // True for agent suggestions (show hints), false for predictions (fish-style)
+	Source     GhostSource
+	// FromAgent is kept for compatibility with existing callers. New code must
+	// use Source and IsAgentOwned instead.
+	FromAgent bool
 }
 
 // NewGhostText creates a new ghost text state.
@@ -18,9 +38,16 @@ func NewGhostText() *GhostText {
 
 // Set sets the ghost text content.
 func (g *GhostText) Set(text string) {
+	g.SetSource(text, GhostHistory)
+}
+
+// SetSource sets ghost content with explicit ownership.
+func (g *GhostText) SetSource(text string, source GhostSource) {
 	g.Text = text
 	g.AcceptedAt = 0
 	g.Active = true
+	g.Source = source
+	g.FromAgent = source == GhostAgent
 }
 
 // Append adds more text to the ghost (for streaming).
@@ -35,7 +62,20 @@ func (g *GhostText) Clear() {
 	g.AcceptedAt = 0
 	g.Active = false
 	g.Streaming = false
+	g.Source = GhostNone
 	g.FromAgent = false
+}
+
+// IsAgentOwned reports whether this is interactive agent output, which keeps
+// its dedicated hints and acceptance behavior.
+func (g *GhostText) IsAgentOwned() bool {
+	return g.Source == GhostAgent || g.FromAgent
+}
+
+// IsProtected reports ghost content that asynchronous autosuggestions may not
+// overwrite before the user dismisses or edits it.
+func (g *GhostText) IsProtected() bool {
+	return g.IsAgentOwned() || g.Source == GhostLearnedFix || g.Source == GhostPreviousCommand
 }
 
 // Remaining returns the unaccepted portion of ghost text.
@@ -63,26 +103,30 @@ func (g *GhostText) AcceptWord() string {
 		return ""
 	}
 
-	// Find end of next word (including trailing space)
+	// Consume leading whitespace, one complete Unicode word, and trailing
+	// whitespace. All offsets remain byte offsets, but are advanced only by
+	// decoded rune sizes so a partial acceptance never splits UTF-8.
 	end := 0
-	inWord := false
-	for i, r := range remaining {
-		if r == ' ' || r == '\t' {
-			if inWord {
-				// Found end of word, include trailing spaces
-				for j := i; j < len(remaining); j++ {
-					if remaining[j] != ' ' && remaining[j] != '\t' {
-						end = j
-						break
-					}
-					end = j + 1
-				}
-				break
-			}
-		} else {
-			inWord = true
+	for end < len(remaining) {
+		r, size := utf8.DecodeRuneInString(remaining[end:])
+		if !unicode.IsSpace(r) {
+			break
 		}
-		end = i + 1
+		end += size
+	}
+	for end < len(remaining) {
+		r, size := utf8.DecodeRuneInString(remaining[end:])
+		if unicode.IsSpace(r) {
+			break
+		}
+		end += size
+	}
+	for end < len(remaining) {
+		r, size := utf8.DecodeRuneInString(remaining[end:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		end += size
 	}
 
 	accepted := remaining[:end]

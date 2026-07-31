@@ -4,9 +4,157 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
+
+func TestAutosuggestionsConfig_Defaults(t *testing.T) {
+	cfg := Default().Autosuggestions
+
+	if !cfg.Enabled {
+		t.Error("autosuggestions should be enabled by default")
+	}
+	if !reflect.DeepEqual(cfg.Strategies, []string{"history"}) {
+		t.Errorf("Strategies = %v, want [history]", cfg.Strategies)
+	}
+	if cfg.MinInputLength != 2 {
+		t.Errorf("MinInputLength = %d, want 2", cfg.MinInputLength)
+	}
+	if cfg.MaxBufferSize != 0 {
+		t.Errorf("MaxBufferSize = %d, want 0", cfg.MaxBufferSize)
+	}
+	if cfg.CompletionTimeout != "150ms" {
+		t.Errorf("CompletionTimeout = %q, want 150ms", cfg.CompletionTimeout)
+	}
+	if got, err := cfg.ParseCompletionTimeout(); err != nil || got != 150*time.Millisecond {
+		t.Errorf("ParseCompletionTimeout() = %v, %v; want 150ms, nil", got, err)
+	}
+}
+
+func TestAutosuggestionsConfig_LoadPreservesStrategyOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := []byte(`
+[autosuggestions]
+enabled = false
+strategies = ["completion", "match_prev_cmd", "history"]
+min_input_length = 4
+max_buffer_size = 100
+history_ignore = ["secret*"]
+completion_ignore = ["git push*"]
+completion_timeout = "250ms"
+`)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.toml"), content, 0o644); err != nil { //nolint:gosec // G306: test file
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(tmpDir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	got := cfg.Autosuggestions
+	if got.Enabled || !reflect.DeepEqual(got.Strategies, []string{"completion", "match_prev_cmd", "history"}) ||
+		got.MinInputLength != 4 || got.MaxBufferSize != 100 ||
+		!reflect.DeepEqual(got.HistoryIgnore, []string{"secret*"}) ||
+		!reflect.DeepEqual(got.CompletionIgnore, []string{"git push*"}) || got.CompletionTimeout != "250ms" {
+		t.Errorf("Autosuggestions = %+v, want configured values", got)
+	}
+}
+
+func TestAutosuggestionsConfig_Validation(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  AutosuggestionsConfig
+	}{
+		{name: "empty strategy", cfg: AutosuggestionsConfig{Strategies: []string{""}, CompletionTimeout: "1ms"}},
+		{name: "unknown strategy", cfg: AutosuggestionsConfig{Strategies: []string{"remote"}, CompletionTimeout: "1ms"}},
+		{name: "duplicate strategy", cfg: AutosuggestionsConfig{Strategies: []string{"history", "history"}, CompletionTimeout: "1ms"}},
+		{name: "negative minimum", cfg: AutosuggestionsConfig{Strategies: []string{"history"}, MinInputLength: -1, CompletionTimeout: "1ms"}},
+		{name: "negative maximum", cfg: AutosuggestionsConfig{Strategies: []string{"history"}, MaxBufferSize: -1, CompletionTimeout: "1ms"}},
+		{name: "zero timeout", cfg: AutosuggestionsConfig{Strategies: []string{"history"}, CompletionTimeout: "0s"}},
+		{name: "negative timeout", cfg: AutosuggestionsConfig{Strategies: []string{"history"}, CompletionTimeout: "-1s"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.cfg.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want error")
+			}
+		})
+	}
+}
+
+func TestAutosuggestionsConfig_LoadRejectsInvalidConfiguration(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := []byte(`
+[autosuggestions]
+strategies = ["history", "history"]
+`)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.toml"), content, 0o644); err != nil { //nolint:gosec // G306: test file
+		t.Fatal(err)
+	}
+
+	_, err := Load(tmpDir)
+	if err == nil || !strings.Contains(err.Error(), "autosuggestions") {
+		t.Fatalf("Load() error = %v, want autosuggestions validation error", err)
+	}
+}
+
+func TestAutosuggestionsConfig_RecoveryResetsInvalidAutosuggestions(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := []byte(`
+[prompt]
+mode = 42
+
+[autosuggestions]
+strategies = ["remote"]
+completion_timeout = "0s"
+`)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.toml"), content, 0o644); err != nil { //nolint:gosec // G306: test file
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(tmpDir)
+	if err == nil {
+		t.Fatal("Load() error = nil, want recovered config load issue")
+	}
+	if !reflect.DeepEqual(cfg.Autosuggestions, Default().Autosuggestions) {
+		t.Errorf("Autosuggestions = %+v, want defaults after invalid recovered section", cfg.Autosuggestions)
+	}
+
+	found := false
+	for _, section := range cfg.LoadIssue.BadSections {
+		if section == "autosuggestions" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("BadSections = %v, want autosuggestions", cfg.LoadIssue.BadSections)
+	}
+}
+
+func TestAutosuggestionsConfig_TOMLRoundTrip(t *testing.T) {
+	want := Default().Autosuggestions
+	data, err := toml.Marshal(struct {
+		Autosuggestions AutosuggestionsConfig `toml:"autosuggestions"`
+	}{Autosuggestions: want})
+	if err != nil {
+		t.Fatalf("toml.Marshal() error = %v", err)
+	}
+	var got struct {
+		Autosuggestions AutosuggestionsConfig `toml:"autosuggestions"`
+	}
+	if err := toml.Unmarshal(data, &got); err != nil {
+		t.Fatalf("toml.Unmarshal() error = %v", err)
+	}
+	if !reflect.DeepEqual(got.Autosuggestions, want) {
+		t.Errorf("round trip = %+v, want %+v", got.Autosuggestions, want)
+	}
+}
 
 func TestLoadConfig_DefaultValues(t *testing.T) {
 	// Create temp dir with no config file

@@ -1,6 +1,7 @@
 package prediction
 
 import (
+	"context"
 	"strings"
 	"time"
 )
@@ -57,6 +58,48 @@ func (p *Predictor) PredictCommand(lastCmd, cwd string) string {
 		return best.NextCommand
 	}
 	return ""
+}
+
+// SuggestCommandPrefix returns the best learned next command that strictly
+// extends prefix after lastCmd. It is context-aware for editor cancellation and
+// ranks exact-CWD data ahead of generic sequence data.
+func (p *Predictor) SuggestCommandPrefix(ctx context.Context, lastCmd, prefix, cwd string) (string, error) {
+	if !p.config.Enabled || p.store == nil || lastCmd == "" || prefix == "" {
+		return "", nil
+	}
+	lastCmd = normalizeCommand(lastCmd)
+	if lastCmd == "" {
+		return "", nil
+	}
+
+	seqs, err := p.store.GetSequencesByPrefixContext(ctx, lastCmd, prefix, cwd)
+	if err != nil {
+		return "", err
+	}
+
+	bestRank := -1
+	bestScore := 0.0
+	best := ""
+	for _, seq := range seqs {
+		if !strings.HasPrefix(seq.NextCommand, prefix) || seq.NextCommand == prefix {
+			continue
+		}
+		rank := 1
+		if seq.CwdPattern == cwd {
+			rank = 0
+		}
+		if bestRank >= 0 && rank > bestRank {
+			continue
+		}
+		score := p.scoreSequence(seq)
+		if score < p.config.ConfidenceThreshold {
+			continue
+		}
+		if bestRank == -1 || rank < bestRank || score > bestScore {
+			best, bestRank, bestScore = seq.NextCommand, rank, score
+		}
+	}
+	return best, nil
 }
 
 // PredictPaths predicts paths for a command.

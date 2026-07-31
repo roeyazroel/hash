@@ -23,12 +23,16 @@ func makeEditorCompleteOutcomeFunc(router *completion.Router) func(string, int) 
 			return editor.CompletionOutcome{TimedOut: timedOut}
 		}
 
-		items := make([]editor.Completion, len(result.Items))
-		for i, item := range result.Items {
-			items[i] = editor.Completion{
-				Text:        result.Prefix + item.Value,
-				Description: item.Description,
+		items := make([]editor.Completion, 0, len(result.Items))
+		for _, item := range result.Items {
+			fullLine, replacement, ok := completion.ReconstructLine(line, pos, result, item)
+			if !ok {
+				continue
 			}
+			items = append(items, editor.Completion{
+				Text:        fullLine[replacement.Start:replacement.End],
+				Description: item.Description,
+			})
 		}
 		return editor.CompletionOutcome{Items: items}
 	}

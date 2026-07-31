@@ -19,6 +19,7 @@ import (
 
 	"github.com/tfcace/hash/internal/agent"
 	"github.com/tfcace/hash/internal/allowlist"
+	"github.com/tfcace/hash/internal/autosuggest"
 	"github.com/tfcace/hash/internal/clipboard"
 	"github.com/tfcace/hash/internal/completion"
 	"github.com/tfcace/hash/internal/config"
@@ -47,34 +48,35 @@ type Mode struct {
 
 // Shell is the main Hash shell instance.
 type Shell struct {
-	mode                Mode // Startup mode
-	config              *config.Config
-	executor            *executor.Executor
-	prompt              *prompt.Prompt
-	readline            *readline.Readline
-	inputHandler        *readline.InputHandler // For Ctrl+R search
-	editorCfg           editor.Config          // Editor configuration
-	agentHandler        *AgentHandler
-	responseUI          *ResponseUI
-	history             *history.Store
-	historyPath         string
-	learning            *learning.FixStore
-	fixes               *fixTracker     // Learning loop: observes outcomes, suggests fixes
-	errors              *ErrorHandler   // Renders error/fix banners (stderr by default)
-	branchLister        func() []string // Local git branches for did-you-mean; nil = gitBranches
-	clipboard           *clipboard.Buffer
-	predictor           *prediction.Predictor
-	suggestor           *CommandSuggestor
-	colorPalette        prompt.Palette
-	allowlist           *allowlist.Manager
-	agentOutput         *AgentOutputCoordinator
-	readKey             func(ctx context.Context) byte
-	agentReplyInputHook func(context.Context) (string, error)
-	lastExitCode        int
-	lastDuration        time.Duration
-	lastCommand         string // Last executed command
-	lastStderr          string // Stderr from last command (truncated)
-	lastCwd             string // Working directory of last command
+	mode                  Mode // Startup mode
+	config                *config.Config
+	executor              *executor.Executor
+	prompt                *prompt.Prompt
+	readline              *readline.Readline
+	inputHandler          *readline.InputHandler // For Ctrl+R search
+	editorCfg             editor.Config          // Editor configuration
+	agentHandler          *AgentHandler
+	responseUI            *ResponseUI
+	history               *history.Store
+	historyPath           string
+	learning              *learning.FixStore
+	fixes                 *fixTracker     // Learning loop: observes outcomes, suggests fixes
+	errors                *ErrorHandler   // Renders error/fix banners (stderr by default)
+	branchLister          func() []string // Local git branches for did-you-mean; nil = gitBranches
+	clipboard             *clipboard.Buffer
+	predictor             *prediction.Predictor
+	suggestor             *CommandSuggestor
+	colorPalette          prompt.Palette
+	allowlist             *allowlist.Manager
+	agentOutput           *AgentOutputCoordinator
+	readKey               func(ctx context.Context) byte
+	agentReplyInputHook   func(context.Context) (string, error)
+	lastExitCode          int
+	lastDuration          time.Duration
+	lastCommand           string // Last executed command
+	lastSuccessfulCommand string // Last command that completed successfully
+	lastStderr            string // Stderr from last command (truncated)
+	lastCwd               string // Working directory of last command
 
 	osc *integration.Emitter // OSC shell integration emitter
 
@@ -119,27 +121,27 @@ func New(cfg *config.Config) (*Shell, error) {
 
 	fileCompleter := completion.NewFileCompleter()
 	fileCompleter.SetFuzzyMode(cfg.Completions.Fuzzy)
-	router.Register(fileCompleter, completion.PriorityFilesystem)
+	router.RegisterSpeculative(fileCompleter, completion.PriorityFilesystem)
 
 	// Alias/function completer for user-defined functions
-	router.Register(completion.NewAliasCompleter(e), completion.PriorityAlias)
+	router.RegisterSpeculative(completion.NewAliasCompleter(e), completion.PriorityAlias)
 
 	// Environment variable completer ($VAR, ${VAR})
 	envCompleter := completion.NewEnvCompleter(e)
 	envCompleter.SetMaskSensitive(cfg.Completions.MaskSensitiveEnv)
-	router.Register(envCompleter, completion.PriorityEnv)
+	router.RegisterSpeculative(envCompleter, completion.PriorityEnv)
 
 	// Executable completer for command names from PATH
-	router.Register(completion.NewExecutableCompleter(), completion.PriorityExecutable)
+	router.RegisterSpeculative(completion.NewExecutableCompleter(), completion.PriorityExecutable)
 
 	// Context-aware completions for git/jj branch and revision args.
-	router.Register(completion.NewVCSCompleter(), completion.PriorityVCS)
+	router.RegisterSpeculative(completion.NewVCSCompleter(), completion.PriorityVCS)
 
 	// Semantic completions for common commands (ssh, make, kill, npm, etc.)
-	router.Register(completion.NewSemanticCompleter(), completion.PrioritySemantic)
+	router.RegisterSpeculative(completion.NewSemanticCompleter(), completion.PrioritySemantic)
 
 	if cfg.Completions.CobraEnabled {
-		router.Register(completion.NewCobraCompleter(), completion.PriorityToolNative)
+		router.RegisterSpeculative(completion.NewCobraCompleter(), completion.PriorityToolNative)
 	}
 
 	// Set up agent (for both ?? commands and completions)
@@ -240,14 +242,14 @@ func New(cfg *config.Config) (*Shell, error) {
 
 	// Initialize prediction store and predictor
 	var predictor *prediction.Predictor
-	if cfg.Prediction.Enabled {
+	if needsPredictionStore(cfg) {
 		predictionPath := filepath.Join(getDataDir(), "prediction.db")
 		predictionStore, err := prediction.NewStore(predictionPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "hash: warning: prediction unavailable: %v\n", err)
 		} else {
 			predCfg := prediction.Config{
-				Enabled:             cfg.Prediction.Enabled,
+				Enabled:             true,
 				AcceptKeys:          cfg.Prediction.AcceptKeys,
 				ConfidenceThreshold: cfg.Prediction.ConfidenceThreshold,
 				PathMinCount:        cfg.Prediction.PathMinCount,
@@ -311,15 +313,19 @@ func New(cfg *config.Config) (*Shell, error) {
 	}
 
 	// Configure editor mode
+	var autosuggestionService editor.AutosuggestionService
+	if cfg.Autosuggestions.Enabled {
+		autosuggestionService = makeEditorAutosuggestionService(cfg.Autosuggestions, historyStore, predictor, router)
+	}
 	editorCfg := editor.Config{
-		Keybindings:         cfg.Input.Keybindings,
-		Gutter:              cfg.Input.Gutter,
-		InputBgColor:        "",
-		ScrollbarColor:      colorPalette.Primary,
-		CompleteOutcomeFunc: makeEditorCompleteOutcomeFunc(router),
-		PrefetchFunc:        makeEditorPrefetchFunc(router),
-		SuggestionFunc:      makeEditorSuggestionFunc(historyStore, predictor),
-		MaxPasteSize:        cfg.Input.ParseMaxPasteSize(),
+		Keybindings:           cfg.Input.Keybindings,
+		Gutter:                cfg.Input.Gutter,
+		InputBgColor:          "",
+		ScrollbarColor:        colorPalette.Primary,
+		CompleteOutcomeFunc:   makeEditorCompleteOutcomeFunc(router),
+		PrefetchFunc:          makeEditorPrefetchFunc(router),
+		AutosuggestionService: autosuggestionService,
+		MaxPasteSize:          cfg.Input.ParseMaxPasteSize(),
 	}
 
 	// Capture initial working directory for chpwd hook
@@ -349,6 +355,9 @@ func New(cfg *config.Config) (*Shell, error) {
 		historyIndex: -1, // Start before history (current line)
 		osc:          osc,
 		prevCwd:      initialCwd,
+	}
+	if autosuggestionService != nil {
+		shell.editorCfg.AutosuggestionRequest = shell.autosuggestionRequest
 	}
 
 	if acpTransport != nil {
@@ -382,6 +391,24 @@ func New(cfg *config.Config) (*Shell, error) {
 	})
 
 	return shell, nil
+}
+
+func needsPredictionStore(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Prediction.Enabled {
+		return true
+	}
+	if !cfg.Autosuggestions.Enabled {
+		return false
+	}
+	for _, strategy := range cfg.Autosuggestions.Strategies {
+		if strategy == "match_prev_cmd" {
+			return true
+		}
+	}
+	return false
 }
 
 // NewWithMode creates a new Shell instance with explicit mode.
@@ -608,7 +635,7 @@ func (s *Shell) dispatchCommand(ctx context.Context, line string) error {
 	case parser.CommandTypeEmpty:
 		s.updatePrompt()
 	case parser.CommandTypeAgent, parser.CommandTypeAgentPipe, parser.CommandTypeAgentInline:
-		s.recordCommand(line, 0, 0)
+		s.recordAgentRequest(line)
 		if err := s.handleAgentRequest(ctx, parsed); err != nil {
 			return err
 		}
@@ -789,9 +816,9 @@ func (s *Shell) readLineWithEditor(ctx context.Context) (string, error) {
 			ed.SetInitialText(initialText)
 		}
 
-		// Ghost text: learned fix for the last failure, else prediction
-		if ghost := s.promptGhost(); ghost != "" {
-			ed.SetGhostText(ghost)
+		// Ghost text: learned fix for the last failure, else prediction.
+		if ghost, source := s.promptGhostWithSource(); ghost != "" {
+			ed.SetGhostTextSource(ghost, source)
 		}
 
 		result, err := ed.Run(ctx)
@@ -1673,19 +1700,35 @@ func makeEditorPrefetchFunc(router *completion.Router) func(string, int) {
 	}
 }
 
-func makeEditorSuggestionFunc(store *history.Store, pred *prediction.Predictor) func(string) string {
-	return func(input string) string {
-		// Try history prefix search first
-		if store != nil {
-			matches, err := store.SearchByPrefix(input, 1)
-			if err == nil && len(matches) > 0 {
-				return matches[0]
-			}
+func makeEditorAutosuggestionService(cfg config.AutosuggestionsConfig, store *history.Store, pred *prediction.Predictor, router *completion.Router) *autosuggest.Engine {
+	strategies := make([]autosuggest.Strategy, 0, len(cfg.Strategies))
+	timeout, err := cfg.ParseCompletionTimeout()
+	if err != nil {
+		timeout = editorCompletionTimeout
+	}
+	for _, name := range cfg.Strategies {
+		switch name {
+		case "history":
+			strategies = append(strategies, autosuggest.HistoryStrategy{Store: store, Ignore: cfg.HistoryIgnore})
+		case "match_prev_cmd":
+			strategies = append(strategies, autosuggest.MatchPreviousCommandStrategy{Provider: pred})
+		case "completion":
+			strategies = append(strategies, autosuggest.CompletionStrategy{Router: router, Ignore: cfg.CompletionIgnore, Timeout: timeout})
 		}
+	}
+	return autosuggest.NewEngine(autosuggest.Config{
+		MinInputLength: cfg.MinInputLength,
+		MaxBufferSize:  cfg.MaxBufferSize,
+	}, strategies)
+}
 
-		_ = pred // predictor fallback reserved for future use
-
-		return ""
+func (s *Shell) autosuggestionRequest(line string, cursor int) autosuggest.Request {
+	cwd, _ := os.Getwd()
+	return autosuggest.Request{
+		Line:            line,
+		Cursor:          cursor,
+		PreviousCommand: s.lastSuccessfulCommand,
+		CWD:             cwd,
 	}
 }
 
@@ -1705,6 +1748,9 @@ func (s *Shell) Close() error {
 
 // recordCommand saves a command to history.
 func (s *Shell) recordCommand(line string, exitCode int, duration time.Duration) {
+	if exitCode == 0 {
+		s.lastSuccessfulCommand = line
+	}
 	if s.history == nil {
 		return
 	}
@@ -1728,6 +1774,14 @@ func (s *Shell) recordCommand(line string, exitCode int, duration time.Duration)
 	}
 
 	_, _ = s.history.Add(cmd)
+}
+
+// recordAgentRequest keeps agent prompts in history without treating an
+// unexecuted request as a successful shell command for match_prev_cmd.
+func (s *Shell) recordAgentRequest(line string) {
+	lastSuccessfulCommand := s.lastSuccessfulCommand
+	s.recordCommand(line, 0, 0)
+	s.lastSuccessfulCommand = lastSuccessfulCommand
 }
 
 // detectGitBranch returns the current git branch, or empty string if not in a git repo.

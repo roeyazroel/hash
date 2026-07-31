@@ -142,6 +142,19 @@ func TestDisplay_VisibleWidthUsesTerminalCells(t *testing.T) {
 	}
 }
 
+func TestDisplay_MultilineAgentGhostAccountsForFinalHint(t *testing.T) {
+	d := NewDisplay(io.Discard, 14, 24)
+	ghost := " status\n--short"
+	hintWidth := visibleWidth("   [enter]run  [tab]edit  [esc]")
+
+	if got, want := renderedGhostSuffixWidth(ghost, false, true), visibleWidth(" status"); got != want {
+		t.Errorf("renderedGhostSuffixWidth() = %d, want %d", got, want)
+	}
+	if got, want := d.ghostContinuationRows(ghost, false, true), d.visualRowsForChars(visibleWidth("--short")+hintWidth); got != want {
+		t.Errorf("ghostContinuationRows() = %d, want %d", got, want)
+	}
+}
+
 func TestDisplay_RenderCompletionMenu_WithGutter(t *testing.T) {
 	var buf bytes.Buffer
 	d := NewDisplay(&buf, 80, 24)
@@ -474,5 +487,26 @@ func TestDisplay_RenderCompletionMenu_WrapsLongColumns(t *testing.T) {
 	// cursorCol=17 + prefix=2 => wrapped restore column 9
 	if !strings.Contains(output, "\x1b[9C") {
 		t.Fatalf("menu should restore wrapped cursor column 9, got %q", output)
+	}
+}
+
+func TestDisplay_RenderWithGhost_RendersMultilineSuffixAndRestoresCursor(t *testing.T) {
+	var out bytes.Buffer
+	d := NewDisplay(&out, 10, 24)
+	d.SetPrompt("$ ")
+	buf := NewBufferFromString("git")
+	cur := NewCursor()
+	cur.MoveTo(0, len("git"))
+
+	d.RenderWithGhost(buf, cur, false, " status\n--short", false, false, "")
+	got := out.String()
+	if !strings.Contains(got, " status") || !strings.Contains(got, "--short") {
+		t.Fatalf("rendered ghost = %q, want every logical ghost line", got)
+	}
+	if d.lastLines < 2 {
+		t.Fatalf("lastLines = %d, want multiline ghost layout", d.lastLines)
+	}
+	if !strings.Contains(got, "\x1b[") {
+		t.Fatal("render should restore the editable cursor after ghost output")
 	}
 }

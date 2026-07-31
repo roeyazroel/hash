@@ -1,6 +1,7 @@
 package editor
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
@@ -191,6 +192,55 @@ func TestGhostText_UTF8(t *testing.T) {
 
 	if g.Remaining() != "llo wörld" {
 		t.Errorf("expected 'llo wörld', got %q", g.Remaining())
+	}
+}
+
+func TestGhostText_AcceptWordIsUTF8Safe(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "emoji", text: "🚀 deploy", want: "🚀 "},
+		{name: "emoji only", text: "🚀", want: "🚀"},
+		{name: "combining", text: "e\u0301clair next", want: "e\u0301clair "},
+		{name: "punctuation", text: "--flag=value next", want: "--flag=value "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGhostText()
+			g.Set(tt.text)
+			if got := g.AcceptWord(); got != tt.want {
+				t.Errorf("AcceptWord() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEditor_GhostEndAndRightAcceptOnlyAtBufferEnd(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		key  KeyCode
+	}{{"right", KeyRight}, {"end", KeyEnd}} {
+		t.Run(test.name, func(t *testing.T) {
+			ed := New(Config{}, strings.NewReader(""), io.Discard)
+			ed.state.Buffer = NewBufferFromString("git")
+			ed.state.Cursor.MoveTo(0, len("git"))
+			ed.ghost.Set(" status")
+			ed.handleKeyEvent(Key{Special: test.key})
+			if got := ed.state.Buffer.Content(); got != "git status" {
+				t.Errorf("accepted buffer = %q, want git status", got)
+			}
+		})
+	}
+
+	ed := New(Config{}, strings.NewReader(""), io.Discard)
+	ed.state.Buffer = NewBufferFromString("git")
+	ed.state.Cursor.MoveTo(0, 1)
+	ed.ghost.Set(" status")
+	ed.handleKeyEvent(Key{Special: KeyEnd})
+	if got := ed.state.Buffer.Content(); got != "git" {
+		t.Errorf("middle-buffer End changed buffer to %q", got)
 	}
 }
 

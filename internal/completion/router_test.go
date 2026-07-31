@@ -57,6 +57,19 @@ type namedBlockingCompleter struct {
 	calls   atomic.Int32
 }
 
+type firstCallBlockingCompleter struct {
+	release <-chan struct{}
+	calls   atomic.Int32
+}
+
+func (m *firstCallBlockingCompleter) Name() string { return "first-call-blocking" }
+func (m *firstCallBlockingCompleter) Complete(ctx context.Context, line string, pos int) (Result, error) {
+	if m.calls.Add(1) == 1 {
+		<-m.release
+	}
+	return Result{Items: []Item{{Value: "status"}}}, nil
+}
+
 func (m *namedBlockingCompleter) Name() string { return m.name }
 func (m *namedBlockingCompleter) Complete(ctx context.Context, line string, pos int) (Result, error) {
 	m.calls.Add(1)
@@ -198,6 +211,83 @@ func TestRouter_CompleteBoundedUsesFallbackWhileEarlierCompleterIsStuck(t *testi
 	if len(result.Items) != 1 || result.Items[0].Value != "fallback-result" {
 		t.Fatalf("expected fallback completion while earlier completer is stuck, got %#v", result.Items)
 	}
+}
+
+func TestRouter_CompleteSpeculative_ExcludesAgentAndDisablesFuzzyMatching(t *testing.T) {
+	local := &MockCompleter{name: "local", items: []Item{{Value: "git status"}, {Value: "git stash"}}}
+	agent := &MockCompleter{name: "agent", items: []Item{{Value: "agent result"}}}
+	router := NewRouter()
+	router.SetFuzzy(true)
+	router.RegisterSpeculative(local, PriorityFilesystem)
+	router.Register(agent, PriorityAgent)
+
+	result, err := router.CompleteSpeculative(context.Background(), "git", len("git"))
+	if err != nil {
+		t.Fatalf("CompleteSpeculative() error = %v", err)
+	}
+	if !local.called || agent.called {
+		t.Errorf("local called = %v, agent called = %v; agent must be excluded", local.called, agent.called)
+	}
+	if len(result.Items) != 1 || result.Items[0].Value != "git status" {
+		t.Fatalf("result = %#v, want only the first unfiltered local item", result.Items)
+	}
+}
+
+func TestRouter_CompleteSpeculative_RequiresExplicitLocalOptIn(t *testing.T) {
+	local := &MockCompleter{name: "local", items: []Item{{Value: "git status"}}}
+	router := NewRouter()
+	router.Register(local, PriorityFilesystem)
+
+	result, err := router.CompleteSpeculative(context.Background(), "git", len("git"))
+	if err != nil {
+		t.Fatalf("CompleteSpeculative() error = %v", err)
+	}
+	if local.called || len(result.Items) != 0 {
+		t.Fatalf("non-opt-in completer ran speculatively: called=%v result=%#v", local.called, result.Items)
+	}
+}
+
+func TestRouter_CompleteSpeculative_SelectsFirstStrictExtension(t *testing.T) {
+	local := &MockCompleter{name: "local", items: []Item{{Value: "checkout"}, {Value: "chekout"}}}
+	router := NewRouter()
+	router.RegisterSpeculative(local, PriorityFilesystem)
+
+	result, err := router.CompleteSpeculative(context.Background(), "git chek", len("git chek"))
+	if err != nil {
+		t.Fatalf("CompleteSpeculative() error = %v", err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Value != "chekout" {
+		t.Fatalf("result = %#v, want first strict extension item", result.Items)
+	}
+}
+
+func TestRouter_InteractiveCompletionDoesNotWaitForSpeculativeWorker(t *testing.T) {
+	release := make(chan struct{})
+	blocking := &firstCallBlockingCompleter{release: release}
+	router := NewRouter()
+	router.RegisterSpeculative(blocking, PriorityFilesystem)
+
+	speculativeDone := make(chan struct{})
+	go func() {
+		_, _ = router.CompleteSpeculative(context.Background(), "git ", len("git "))
+		close(speculativeDone)
+	}()
+	if !eventuallyTrue(100*time.Millisecond, func() bool { return blocking.calls.Load() == 1 }) {
+		t.Fatal("speculative completion did not start")
+	}
+
+	result, err := completeWithTestTimeout(t, router, context.Background(), "git ", len("git "))
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Value != "status" {
+		t.Fatalf("interactive result = %#v, want local result", result.Items)
+	}
+	if got := blocking.calls.Load(); got != 2 {
+		t.Fatalf("interactive completion shared speculative in-flight work; calls = %d, want 2", got)
+	}
+	close(release)
+	<-speculativeDone
 }
 
 func TestRouter_CompleteReturnsWhenCompleterIgnoresContext(t *testing.T) {
